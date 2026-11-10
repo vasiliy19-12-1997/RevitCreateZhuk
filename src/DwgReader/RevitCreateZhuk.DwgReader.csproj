@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="ACadSharp" Version="3.7.16" />
+    <Compile Include="..\Core\*.cs" Link="Core\%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>
