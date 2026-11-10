@@ -40,15 +40,19 @@ namespace RevitCreateZhuk
             foreach (var part in parts) controls.Add(part, Resolve(part));
         }
 
-        public void Bind(FamilyInstance instance, SchemePart part)
+        public bool TryBind(Element element, SchemePart part)
         {
             var control = controls[part];
-            var parameter = instance.get_Parameter(BuiltInParameter.IS_VISIBLE_PARAM);
+            var parameter = element.get_Parameter(BuiltInParameter.IS_VISIBLE_PARAM);
             if (parameter == null || !manager.CanElementParameterBeAssociated(parameter))
-                throw new InvalidOperationException("Revit не разрешил связать видимость группы «" +
-                    control.Definition.Name + "».");
-            manager.AssociateElementParameterToFamilyParameter(parameter, control);
+                return false;
+            try { manager.AssociateElementParameterToFamilyParameter(parameter, control); }
+            catch (Autodesk.Revit.Exceptions.ArgumentException) { return false; }
+            catch (Autodesk.Revit.Exceptions.InvalidOperationException) { return false; }
+            return true;
         }
+
+        public string ControlName(SchemePart part) => controls[part].Definition.Name;
 
         private FamilyParameter Resolve(SchemePart part)
         {

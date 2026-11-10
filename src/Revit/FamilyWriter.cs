@@ -30,40 +30,17 @@ namespace RevitCreateZhuk
                 View view = FamilyDocuments.AnnotationView(target);
                 ImportSource(target, view, input.SourcePath);
                 if (input.ParkingPath != null) ImportSource(target, view, input.ParkingPath);
-                var files = new Dictionary<SchemePart, string>();
-                var directNotes = new List<SchemePart>();
                 var graphics = new AnnotationGraphics(input.FeetPerUnit);
-                foreach (var part in input.Parts)
-                {
-                    var nestedPart = part;
-                    if (input.NativeMarkText)
-                    {
-                        var notes = part.Items.Where(Composition.IsMarkText).ToArray();
-                        if (notes.Length > 0)
-                        {
-                            directNotes.Add(part.WithItems(notes));
-                            nestedPart = part.WithItems(part.Items.Where(i => !Composition.IsMarkText(i)));
-                        }
-                    }
-                    if (nestedPart.Items.Count == 0) continue;
-                    string file = Path.Combine(work, "Жук_" + Visibility.Hash(Guid.NewGuid().ToString()) + ".rfa");
-                    temporaryFiles.Add(file);
-                    if (BuildNestedFamily(input.TemplatePath, file, nestedPart, graphics))
-                        files.Add(nestedPart, file);
-                }
-                if (files.Count == 0 && directNotes.Count == 0)
-                    throw new InvalidOperationException("Масштаб не оставил объектов допустимого размера.");
-                var unmoved = PlaceParts(target, view, source, files, directNotes, graphics, existing == null);
+                var result = PlaceParts(target, view, source, input, graphics, existing == null, work, temporaryFiles);
                 if (existing == null)
                     target.SaveAs(output, new SaveAsOptions { OverwriteExistingFile = true, Compact = true });
-                var levels = files.Keys.Where(p => p.Role == Role.Geometry).SelectMany(p => p.Buildings)
+                var levels = input.Parts.Where(p => p.Role == Role.Geometry).SelectMany(p => p.Buildings)
                     .Where(Composition.IsParking).Select(Visibility.BuildingParameterName)
                     .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-                return $"Построено групп: {files.Count}. Перенесено CAD-объектов: {graphics.WrittenItems}." +
-                    (directNotes.Count == 0 ? "" : $"\nРедактируемых подписей разрезов и фасадов: {directNotes.Sum(p => p.Items.Count)}.") +
+                return $"Перенесено CAD-объектов: {graphics.WrittenItems}. Вложенных семейств: {result.NestedCount}." +
                     (levels.Length == 0 ? "" : "\nПостроены уровни: " + string.Join(", ", levels) + ".") +
                     (graphics.SkippedItems == 0 ? "" : $" Пропущено при построении: {graphics.SkippedItems}.") +
-                    (unmoved.Count == 0 ? "" : "\nRevit сохранил прежнюю группу параметров: " + string.Join(", ", unmoved)) +
+                    (result.Unmoved.Count == 0 ? "" : "\nRevit сохранил прежнюю группу параметров: " + string.Join(", ", result.Unmoved)) +
                     (existing == null ? "\nСемейство сохранено в " + output : "\nИзменения внесены в текущее семейство. Сохраните его в Revit.");
             }
             finally
@@ -101,7 +78,7 @@ namespace RevitCreateZhuk
             }
         }
 
-        private bool BuildNestedFamily(string template, string path, SchemePart part, AnnotationGraphics graphics)
+        private bool BuildNestedFamily(string template, string path, IEnumerable<SchemePart> parts, AnnotationGraphics graphics)
         {
             var child = application.NewFamilyDocument(template);
             try
@@ -113,7 +90,9 @@ namespace RevitCreateZhuk
                     FamilyDocuments.Start(transaction);
                     ClearTemplateNotes(child);
                     if (child.FamilyManager.Types.Size == 0) child.FamilyManager.NewType("Основной");
-                    if (!graphics.Write(child, view, part))
+                    bool written = false;
+                    foreach (var part in parts) written |= graphics.Write(child, view, part);
+                    if (!written)
                     {
                         transaction.RollBack();
                         return false;
@@ -126,32 +105,89 @@ namespace RevitCreateZhuk
             finally { child.Close(false); }
         }
 
-        private static IReadOnlyList<string> PlaceParts(Document target, View view, string source,
-            Dictionary<SchemePart, string> files, IReadOnlyList<SchemePart> directNotes, AnnotationGraphics graphics, bool newFamily)
+        private (int NestedCount, IReadOnlyList<string> Unmoved) PlaceParts(Document target, View view, string source,
+            SchemeDialog input, AnnotationGraphics graphics, bool newFamily, string work, List<string> temporaryFiles)
         {
             var schema = GetSchema();
-            using (var transaction = new Transaction(target, "RevitCreateZhuk: построить схему"))
+            var fallback = new List<(SchemePart Owner, SchemePart Drawing)>();
+            var directNotes = new List<SchemePart>();
+            using (var group = new TransactionGroup(target, "RevitCreateZhuk: построить схему"))
             {
-                FamilyDocuments.Start(transaction);
-                if (newFamily) ClearTemplateNotes(target);
-                bool replaced = DeletePrevious(target, schema, source, view);
-                var visibility = new Visibility(target, files.Keys, replaced);
-                if (replaced) visibility.RemoveUnusedLegacyParameters();
-                visibility.ApplyInstanceParameters();
-                foreach (var entry in files)
+                if (group.Start() != TransactionStatus.Started)
+                    throw new InvalidOperationException("Revit не смог начать построение схемы.");
+
+                Visibility visibility;
+                using (var transaction = new Transaction(target, "Жук: элементы Revit"))
                 {
-                    if (!target.LoadFamily(entry.Value, out var family))
-                        throw new InvalidOperationException("Не удалось загрузить группу «" + SchemeDialog.RoleName(entry.Key.Role) + "».");
-                    var symbol = (FamilySymbol)target.GetElement(family.GetFamilySymbolIds().Single());
-                    if (!symbol.IsActive) symbol.Activate();
-                    var instance = target.FamilyCreate.NewFamilyInstance(view.Origin, symbol, view);
-                    visibility.Bind(instance, entry.Key);
-                    Tag(instance);
+                    FamilyDocuments.Start(transaction);
+                    if (newFamily) ClearTemplateNotes(target);
+                    bool replaced = DeletePrevious(target, schema, source, view);
+                    visibility = new Visibility(target, input.Parts, replaced);
+                    if (replaced) visibility.RemoveUnusedLegacyParameters();
+                    visibility.ApplyInstanceParameters();
+
+                    foreach (var part in input.Parts)
+                    {
+                        bool IsDirectNote(CadItem item) => input.NativeMarkText && Composition.IsMarkText(item);
+                        var notes = part.Items.Where(IsDirectNote).ToArray();
+                        if (notes.Length > 0) directNotes.Add(part.WithItems(notes));
+
+                        var remaining = new List<CadItem>();
+                        foreach (var batch in part.Items.Where(i => !IsDirectNote(i)).GroupBy(i => i.Text != null))
+                            if (!graphics.TryWriteNative(target, view, part.WithItems(batch), element =>
+                            {
+                                if (!visibility.TryBind(element, part)) return false;
+                                Tag(element);
+                                return true;
+                            }))
+                                remaining.AddRange(batch);
+                        if (remaining.Count > 0) fallback.Add((part, part.WithItems(remaining)));
+                    }
+
+                    graphics.WriteLabels(target, view, directNotes, Tag);
+                    visibility.OrderToggles();
+                    FamilyDocuments.Commit(transaction);
                 }
-                graphics.WriteLabels(target, view, directNotes, Tag);
-                visibility.OrderToggles();
-                FamilyDocuments.Commit(transaction);
-                return visibility.UnmovedParameters.Distinct().ToArray();
+
+                var files = new List<(SchemePart Owner, string Path)>();
+                var names = new FilteredElementCollector(target).OfClass(typeof(Family)).Cast<Family>()
+                    .Select(f => f.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                foreach (var items in fallback.GroupBy(p => visibility.ControlName(p.Owner), StringComparer.OrdinalIgnoreCase))
+                {
+                    string stem = System.Text.RegularExpressions.Regex.Replace(items.Key, @"[^p{L}p{Nd} ._-]", "_");
+                    stem = "Жук - " + stem.Substring(0, Math.Min(stem.Length, 70)).TrimEnd(' ', '.');
+                    string name = stem;
+                    for (int suffix = 2; !names.Add(name); suffix++) name = stem + " " + suffix;
+                    string file = Path.Combine(work, name + ".rfa");
+                    temporaryFiles.Add(file);
+                    if (BuildNestedFamily(input.TemplatePath, file, items.Select(p => p.Drawing), graphics))
+                        files.Add((items.First().Owner, file));
+                }
+
+                if (files.Count != 0)
+                {
+                    using (var transaction = new Transaction(target, "Жук: группы без нативной связи видимости"))
+                    {
+                        FamilyDocuments.Start(transaction);
+                        foreach (var entry in files)
+                        {
+                            if (!target.LoadFamily(entry.Path, out var family))
+                                throw new InvalidOperationException("Не удалось загрузить группу «" + visibility.ControlName(entry.Owner) + "».");
+                            var symbol = (FamilySymbol)target.GetElement(family.GetFamilySymbolIds().Single());
+                            if (!symbol.IsActive) symbol.Activate();
+                            var instance = target.FamilyCreate.NewFamilyInstance(view.Origin, symbol, view);
+                            if (!visibility.TryBind(instance, entry.Owner))
+                                throw new InvalidOperationException("Не удалось связать видимость группы «" + visibility.ControlName(entry.Owner) + "».");
+                            Tag(instance);
+                        }
+                        FamilyDocuments.Commit(transaction);
+                    }
+                }
+                if (graphics.WrittenItems == 0)
+                    throw new InvalidOperationException("Масштаб не оставил объектов допустимого размера.");
+                if (group.Assimilate() != TransactionStatus.Committed)
+                    throw new InvalidOperationException("Revit отменил построение схемы.");
+                return (files.Count, visibility.UnmovedParameters.Distinct().ToArray());
             }
 
             void Tag(Element element)
@@ -178,15 +214,15 @@ namespace RevitCreateZhuk
                 return entity.IsValid() && entity.Get<string>("Source") == source &&
                     entity.Get<string>("View") == view.UniqueId;
             }
-            var previous = all.Where(BelongsToSource).ToList();
-            var notes = new FilteredElementCollector(target).OfClass(typeof(TextNote)).OwnedByView(view.Id)
-                .WhereElementIsNotElementType().Where(BelongsToSource).Select(n => n.Id).ToList();
-            if (previous.Count == 0 && notes.Count == 0) return false;
+            var previous = new FilteredElementCollector(target).WherePasses(new ExtensibleStorageFilter(SchemaId))
+                .WhereElementIsNotElementType().Where(BelongsToSource).ToList();
+            if (previous.Count == 0) return false;
 
             var ids = previous.Select(i => i.Id).ToHashSet();
             var usedElsewhere = all.Where(i => !ids.Contains(i.Id)).Select(i => i.Symbol.Family.Id).ToHashSet();
-            var unused = previous.Select(i => i.Symbol.Family.Id).Distinct().Where(id => !usedElsewhere.Contains(id)).ToList();
-            target.Delete(ids.Concat(notes).ToList());
+            var unused = previous.OfType<FamilyInstance>().Select(i => i.Symbol.Family.Id)
+                .Distinct().Where(id => !usedElsewhere.Contains(id)).ToList();
+            target.Delete(ids.ToList());
             if (unused.Count > 0) target.Delete(unused);
             return true;
         }
@@ -210,4 +246,3 @@ namespace RevitCreateZhuk
         }
     }
 }
-

@@ -24,7 +24,33 @@ namespace RevitCreateZhuk
         public int SkippedItems { get; private set; }
         public int WrittenItems { get; private set; }
 
-        public bool Write(Document doc, View view, SchemePart part)
+        private sealed class VisibilityUnavailableException : Exception { }
+
+        public bool TryWriteNative(Document doc, View view, SchemePart part, Func<Element, bool> bind)
+        {
+            using (var trial = new SubTransaction(doc))
+            {
+                if (trial.Start() != TransactionStatus.Started)
+                    throw new InvalidOperationException("Не удалось начать построение элементов схемы.");
+                int written = WrittenItems, skipped = SkippedItems;
+                try
+                {
+                    Write(doc, view, part, bind);
+                    if (trial.Commit() != TransactionStatus.Committed)
+                        throw new InvalidOperationException("Revit отменил построение элементов схемы.");
+                    return true;
+                }
+                catch (VisibilityUnavailableException)
+                {
+                    trial.RollBack();
+                    WrittenItems = written;
+                    SkippedItems = skipped;
+                    return false;
+                }
+            }
+        }
+
+        public bool Write(Document doc, View view, SchemePart part, Func<Element, bool> bind = null)
         {
             double feetPerUnit = primaryFeetPerUnit * part.UnitFactor;
             double tolerance = doc.Application.ShortCurveTolerance * 1.001;
@@ -32,7 +58,7 @@ namespace RevitCreateZhuk
             var right = view.RightDirection;
             var up = view.UpDirection;
             var style = part.Items.Any(i => i.Text == null) ? CreateStyle(doc, part.Role) : null;
-            bool madeAnything = WriteLabels(doc, view, new[] { part }) > 0;
+            bool madeAnything = WriteLabels(doc, view, new[] { part }, Register) > 0;
             foreach (var item in part.Items.Where(i => i.Text == null))
             {
                 bool created = false;
@@ -80,6 +106,12 @@ namespace RevitCreateZhuk
                 if (detail == null)
                     throw new InvalidOperationException("Revit не создал линию на виде типовой аннотации «" + view.Name + "».");
                 detail.LineStyle = style;
+                Register(detail);
+            }
+
+            void Register(Element element)
+            {
+                if (bind != null && !bind(element)) throw new VisibilityUnavailableException();
             }
 
             bool DrawHatch(CadItem item)
@@ -172,7 +204,11 @@ namespace RevitCreateZhuk
         private static GraphicsStyle CreateStyle(Document document, Role role)
         {
             var categories = document.Settings.Categories;
-            var category = categories.NewSubcategory(document.OwnerFamily.FamilyCategory, "Жук_" + SchemeDialog.RoleName(role));
+            var parent = document.OwnerFamily.FamilyCategory;
+            string name = "Жук_" + SchemeDialog.RoleName(role);
+            var category = parent.SubCategories.Cast<Category>().FirstOrDefault(c => c.Name == name);
+            if (category != null) return category.GetGraphicsStyle(GraphicsStyleType.Projection);
+            category = categories.NewSubcategory(parent, name);
             category.SetLineWeight(1, GraphicsStyleType.Projection);
             var color = DrawingColor(role);
             if (color != null) category.LineColor = color;
@@ -188,5 +224,3 @@ namespace RevitCreateZhuk
         }
     }
 }
-
-
